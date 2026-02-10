@@ -63,7 +63,8 @@ intents.members = True
 if os.environ.get("ENABLE_MESSAGE_CONTENT_INTENT", "1") == "1":
     intents.message_content = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+# Wyłączamy wbudowaną komendę `help`, bo mamy własną.
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 # Tree dla slash commands
 _tree = bot.tree
@@ -835,32 +836,6 @@ async def slash_help(interaction: discord.Interaction):
     await interaction.response.send_message(embed=e, ephemeral=True)
 
 
-@bot.command(name="help")
-async def prefix_help(ctx: commands.Context):
-    """Pomoc dla komend ! (slash jest zalecany)."""
-    e = _music_embed("Pomoc • Komendy bota")
-
-    e.add_field(
-        name="Najlepsza opcja",
-        value="Użyj **`/help`** — tam masz podpowiedzi i autouzupełnianie komend.",
-        inline=False,
-    )
-
-    e.add_field(
-        name="Szybki skrót (prefix)",
-        value=(
-            "• `!play <query>` — dodaj utwór\n"
-            "• `!now` — co gra\n"
-            "• `!queue_show` — kolejka\n"
-            "• `!pause` / `!resume` / `!skip` / `!stop`\n"
-            "• `!loop off|song|queue`\n"
-            "• `!playlist_list` / `!playlist_show <name>` / `!playlist_play <name>`"
-        ),
-        inline=False,
-    )
-
-    await _safe_send(ctx, embed=e)
-
 # ==========================
 # SAFETY / ERROR HANDLING
 # ==========================
@@ -910,10 +885,8 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 
 # ==========================
-# RUN BOT
+# HELP COMMAND (prefix)
 # ==========================
-# (musi być na samym końcu pliku, po definicjach komend)
-
 @bot.command(name="help")
 async def prefix_help(ctx: commands.Context):
     """Pomoc dla komend ! (slash jest zalecany)."""
@@ -941,4 +914,8 @@ async def prefix_help(ctx: commands.Context):
     await _safe_send(ctx, embed=e)
 
 
+# ==========================
+# RUN BOT
+# ==========================
+# (musi być na samym końcu pliku, po definicjach komend)
 bot.run(TOKEN)

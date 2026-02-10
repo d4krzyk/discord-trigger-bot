@@ -156,3 +156,33 @@ Render może pingować HTTP:
 
 - sprawdź `LAVALINK_HOST/PORT/PASSWORD`
 - sprawdź, czy Lavalink jest dostępny z internetu i czy port jest otwarty
+
+## Lavalink na Render: "Authorization missing" w logach
+
+Jeśli w logach Lavalinka widzisz wpisy typu:
+
+- `Authorization missing for ... on GET /` lub `HEAD /`
+
+To zazwyczaj są **pingi/healthchecki Render** albo skanery, które wchodzą na `/` **bez nagłówka `Authorization`**.
+To jest normalne i nie oznacza, że Lavalink nie działa.
+
+### Jak poprawnie testować Lavalink
+
+Lavalink wymaga autoryzacji hasłem. Żeby sprawdzić wersję w przeglądarce/CLI, użyj endpointu `/version` z nagłówkiem `Authorization`.
+
+Przykład (PowerShell):
+
+```powershell
+$headers = @{ Authorization = "TWOJE_HASLO" }
+Invoke-WebRequest -Uri "http://TWOJ_HOST:2333/version" -Headers $headers
+```
+
+### Ustawienia bota
+
+Jeśli Lavalink działa po zwykłym HTTP (w logach masz `Undertow started on port 2333 (http)`), to:
+
+- ustaw `LAVALINK_HTTPS=0` (albo nie ustawiaj wcale)
+
+Jeśli masz reverse proxy i HTTPS, ustaw:
+
+- `LAVALINK_HTTPS=1`
