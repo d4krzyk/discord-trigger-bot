@@ -9,6 +9,7 @@ from typing import Optional, NoReturn
 import discord
 from discord.ext import commands
 import wavelink
+from discord import app_commands
 
 # --- Web/Render keep-alive (Render Web Service oczekuje nasłuchiwania na porcie) ---
 from flask import Flask
@@ -63,6 +64,9 @@ if os.environ.get("ENABLE_MESSAGE_CONTENT_INTENT", "1") == "1":
     intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# Tree dla slash commands
+_tree = bot.tree
 
 # ==========================
 # STATE
@@ -155,18 +159,28 @@ async def _get_player(guild: discord.Guild) -> Optional[wavelink.Player]:
 
 
 async def join_vc(channel: discord.VoiceChannel) -> wavelink.Player:
-    player = await channel.connect(cls=wavelink.Player)
-    return player
+    try:
+        player = await channel.connect(cls=wavelink.Player)
+        return player
+    except Exception as e:
+        print(f"Nie udało się połączyć z VC: {e}")
+        raise
 
 
 async def ensure_connected(ctx: commands.Context) -> Optional[wavelink.Player]:
     if not VC_CHANNEL_ID:
-        await ctx.send("Nie ustawiono kanału VC. Użyj `!set_vc`.")
+        await _safe_send(ctx, embed=_music_embed("Konfiguracja", "**Nie ustawiono kanału VC.**\nUżyj: `!set_vc <kanał>`"))
         return None
 
     vc_channel = ctx.guild.get_channel(VC_CHANNEL_ID)
     if not isinstance(vc_channel, discord.VoiceChannel):
-        await ctx.send("Ustawiony kanał VC nie istnieje lub nie jest kanałem głosowym.")
+        await _safe_send(
+            ctx,
+            embed=_music_embed(
+                "Konfiguracja",
+                "**Ustawiony kanał VC jest nieprawidłowy.**\nUstaw ponownie: `!set_vc <kanał>`",
+            ),
+        )
         return None
 
     player = await _get_player(ctx.guild)
@@ -179,9 +193,12 @@ async def ensure_connected(ctx: commands.Context) -> Optional[wavelink.Player]:
 async def leave_vc_if_empty(channel: discord.VoiceChannel):
     humans = _real_users(channel)
     if len(humans) == 0:
-        player = await _get_player(channel.guild)
-        if player:
-            await player.disconnect()
+        try:
+            player = await _get_player(channel.guild)
+            if player:
+                await player.disconnect()
+        except Exception as e:
+            print(f"Błąd disconnect: {e}")
         queue.clear()
         global current_track
         current_track = None
@@ -219,26 +236,36 @@ async def play_next(guild: discord.Guild):
 
     global current_track
 
-    # Loop pojedynczego utworu: odtwarzaj w kółko to samo
-    if loop_mode == LOOP_SONG and current_track is not None:
+    try:
+        # Loop pojedynczego utworu: odtwarzaj w kółko to samo
+        if loop_mode == LOOP_SONG and current_track is not None:
+            _cancel_idle_task()
+            await player.play(current_track)
+            return
+
+        # Loop kolejki: po zakończeniu utworu wrzuć go na koniec
+        if loop_mode == LOOP_QUEUE and current_track is not None:
+            queue.append(current_track)
+
+        if not queue:
+            current_track = None
+            _schedule_idle_disconnect(guild)
+            return
+
         _cancel_idle_task()
-        await player.play(current_track)
-        return
 
-    # Loop kolejki: po zakończeniu utworu wrzuć go na koniec
-    if loop_mode == LOOP_QUEUE and current_track is not None:
-        queue.append(current_track)
-
-    if not queue:
-        current_track = None
-        _schedule_idle_disconnect(guild)
-        return
-
-    _cancel_idle_task()
-
-    next_track = queue.popleft()
-    current_track = next_track
-    await player.play(next_track)
+        next_track = queue.popleft()
+        current_track = next_track
+        await player.play(next_track)
+    except Exception as e:
+        print(f"Błąd play_next/play: {e}")
+        # jeśli coś poszło nie tak, spróbuj przejść dalej (bez pętli)
+        try:
+            if queue:
+                current_track = None
+                await play_next(guild)
+        except Exception:
+            pass
 
 
 async def _search_track(query: str) -> Optional[wavelink.Playable]:
@@ -278,16 +305,29 @@ async def on_ready():
 
     # Node twórz tylko raz
     if not wavelink.NodePool.nodes:
-        await wavelink.NodePool.create_node(
-            bot=bot,
-            host=os.environ.get("LAVALINK_HOST"),
-            port=int(os.environ.get("LAVALINK_PORT", "2333")),
-            password=os.environ.get("LAVALINK_PASSWORD"),
-            https=True
-        )
+        host = os.environ.get("LAVALINK_HOST")
+        password = os.environ.get("LAVALINK_PASSWORD")
+        if not host or not password:
+            print("Brak LAVALINK_HOST lub LAVALINK_PASSWORD – muzyka nie będzie działać.")
+        else:
+            use_https = os.environ.get("LAVALINK_HTTPS", "0") == "1"
+            try:
+                await wavelink.NodePool.create_node(
+                    bot=bot,
+                    host=host,
+                    port=int(os.environ.get("LAVALINK_PORT", "2333")),
+                    password=password,
+                    https=use_https,
+                )
+            except Exception as e:
+                print(f"Nie udało się połączyć z Lavalink: {e}")
 
     load_playlists()
-    print("Bot gotowy i połączony z Lavalink")
+
+    # Sync slash commands
+    await _sync_app_commands()
+
+    print("Bot gotowy")
 
 # ==========================
 # EVENTS
@@ -384,7 +424,7 @@ async def play(ctx, *, query: str):
 
     track = await _search_track(query)
     if not track:
-        await ctx.send("Nie znaleziono utworu dla podanego zapytania.")
+        await _safe_send(ctx, embed=_music_embed("Szukaj", "**Nie znaleziono utworu** dla podanego zapytania."))
         return
 
     await enqueue_and_maybe_play(ctx, player, track)
@@ -494,10 +534,10 @@ async def stop(ctx):
 @role_only()
 async def playlist_create(ctx, name: str):
     if name in playlists:
-        return await ctx.send("Taka playlista już istnieje.")
+        return await _safe_send(ctx, embed=_music_embed("Playlisty", f"Playlista **{name}** już istnieje."))
     playlists[name] = []
     save_playlists()
-    await ctx.send(f"Stworzono playlistę: {name}")
+    await _safe_send(ctx, embed=_music_embed("Playlisty", f"Utworzono playlistę: **{name}**"))
 
 
 @bot.command()
@@ -515,22 +555,34 @@ async def playlist_list(ctx):
 @role_only()
 async def playlist_add(ctx, playlist_name: str, *, query: str):
     if playlist_name not in playlists:
-        return await ctx.send("Nie znaleziono takiej playlisty.")
+        return await _safe_send(ctx, embed=_music_embed("Playlisty", "**Nie znaleziono takiej playlisty.**"))
     playlists[playlist_name].append(query)
     save_playlists()
-    await ctx.send(f"Dodano do playlisty {playlist_name}: {query}")
+    await _safe_send(ctx, embed=_music_embed("Playlisty", f"Dodano do **{playlist_name}**:\n`{query}`"))
 
 
 @bot.command()
 @role_only()
-async def playlist_remove(ctx, playlist_name: str, *, query: str):
+async def playlist_remove(ctx, playlist_name: str = None, *, query: str = None):
+    if not playlist_name or not query:
+        return await _safe_send(
+            ctx,
+            embed=_music_embed(
+                "Playlisty",
+                "**Musisz podać nazwę playlisty i wpis do usunięcia.**\n"
+                "Przykład: `!playlist_remove moja_playlista utwór_xyz`",
+            ),
+        )
+
     if playlist_name not in playlists:
-        return await ctx.send("Nie znaleziono takiej playlisty.")
+        return await _safe_send(ctx, embed=_music_embed("Playlisty", "**Nie znaleziono takiej playlisty.**"))
+
     if query not in playlists[playlist_name]:
-        return await ctx.send("Ten wpis nie istnieje w playlistie.")
+        return await _safe_send(ctx, embed=_music_embed("Playlisty", "**Ten wpis nie istnieje w playlistie.**"))
+
     playlists[playlist_name].remove(query)
     save_playlists()
-    await ctx.send(f"Usunięto z playlisty {playlist_name}: {query}")
+    await _safe_send(ctx, embed=_music_embed("Playlisty", f"Usunięto z **{playlist_name}**:\n`{query}`"))
 
 
 @bot.command()
@@ -686,6 +738,207 @@ def _track_duration_ms(track: wavelink.Playable) -> Optional[int]:
     return int(length) if isinstance(length, (int, float)) and length > 0 else None
 
 # ==========================
+# SYNC COMMANDS
+# ==========================
+async def _sync_app_commands():
+    """Synchronizuje slash commands (globalnie)."""
+    try:
+        synced = await _tree.sync()
+        print(f"Zsynchronizowano slash commands: {len(synced)}")
+    except Exception as e:
+        print(f"Nie udało się zsynchronizować slash commands: {e}")
+
+# ==========================
+# SLASH COMMANDS (podpowiedzi w Discord)
+# ==========================
+
+async def _autocomplete_loop_mode(interaction: discord.Interaction, current: str):
+    choices = [
+        app_commands.Choice(name="off", value="off"),
+        app_commands.Choice(name="song", value="song"),
+        app_commands.Choice(name="queue", value="queue"),
+    ]
+    cur = (current or "").lower()
+    return [c for c in choices if cur in c.name][:25]
+
+
+async def _autocomplete_playlists(interaction: discord.Interaction, current: str):
+    cur = (current or "").lower()
+    names = sorted(playlists.keys())
+    filtered = [n for n in names if cur in n.lower()]
+    return [app_commands.Choice(name=n, value=n) for n in filtered[:25]]
+
+
+@_tree.command(name="help", description="Pokazuje listę komend i co robią")
+async def slash_help(interaction: discord.Interaction):
+    e = _music_embed("Pomoc • Komendy bota")
+
+    e.add_field(
+        name="Konfiguracja",
+        value=(
+            "**Prefix:** `!`  •  **Slash:** `/`\n"
+            "• `!set_vc <kanał>` — ustaw kanał głosowy\n"
+            "• `!set_text <kanał>` — ustaw kanał tekstowy (opcjonalnie)\n"
+            "• `!set_role <rola>` — ustaw rolę uprawnioną\n"
+        ),
+        inline=False,
+    )
+
+    e.add_field(
+        name="Muzyka",
+        value=(
+            "• `/play query` lub `!play <query>` — dodaj do kolejki\n"
+            "• `/pause` / `/resume` lub `!pause` / `!resume`\n"
+            "• `/skip` lub `!skip` — pomiń utwór\n"
+            "• `/stop` lub `!stop` — zatrzymaj i wyczyść kolejkę\n"
+            "\n**Przykład:** `/play never gonna give you up`"
+        ),
+        inline=False,
+    )
+
+    e.add_field(
+        name="Kolejka i teraz gra",
+        value=(
+            "• `/now` lub `!now` — co aktualnie gra\n"
+            "• `/queue` lub `!queue_show` — podgląd kolejki\n"
+        ),
+        inline=False,
+    )
+
+    e.add_field(
+        name="Loop (zapętlanie)",
+        value=(
+            "• `/loop mode` lub `!loop <mode>`\n"
+            "  Dostępne: **off**, **song**, **queue**\n"
+            "• `!loop_status` — aktualny tryb\n"
+            "\n**Przykład:** `/loop song`"
+        ),
+        inline=False,
+    )
+
+    e.add_field(
+        name="Playlisty",
+        value=(
+            "• `/playlist_list` lub `!playlist_list` — lista playlist\n"
+            "• `/playlist_show name` lub `!playlist_show <name>`\n"
+            "• `/playlist_play name` lub `!playlist_play <name>` — dodaj playlistę do kolejki\n"
+            "\n**Zarządzanie (prefix):**\n"
+            "• `!playlist_create <name>` — utwórz\n"
+            "• `!playlist_add <name> <query>` — dodaj wpis\n"
+            "• `!playlist_remove <name> <query>` — usuń wpis"
+        ),
+        inline=False,
+    )
+
+    e.set_footer(text="Wskazówka: komendy slash (/) mają podpowiedzi i autouzupełnianie.")
+
+    await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+@bot.command(name="help")
+async def prefix_help(ctx: commands.Context):
+    """Pomoc dla komend ! (slash jest zalecany)."""
+    e = _music_embed("Pomoc • Komendy bota")
+
+    e.add_field(
+        name="Najlepsza opcja",
+        value="Użyj **`/help`** — tam masz podpowiedzi i autouzupełnianie komend.",
+        inline=False,
+    )
+
+    e.add_field(
+        name="Szybki skrót (prefix)",
+        value=(
+            "• `!play <query>` — dodaj utwór\n"
+            "• `!now` — co gra\n"
+            "• `!queue_show` — kolejka\n"
+            "• `!pause` / `!resume` / `!skip` / `!stop`\n"
+            "• `!loop off|song|queue`\n"
+            "• `!playlist_list` / `!playlist_show <name>` / `!playlist_play <name>`"
+        ),
+        inline=False,
+    )
+
+    await _safe_send(ctx, embed=e)
+
+# ==========================
+# SAFETY / ERROR HANDLING
+# ==========================
+async def _safe_send(ctx_or_interaction, *, content: Optional[str] = None, embed: Optional[discord.Embed] = None, ephemeral: bool = False):
+    """Bezpieczne wysyłanie wiadomości (nie wywala bota, jeśli np. brak uprawnień)."""
+    try:
+        if isinstance(ctx_or_interaction, discord.Interaction):
+            if ctx_or_interaction.response.is_done():
+                return await ctx_or_interaction.followup.send(content=content, embed=embed, ephemeral=ephemeral)
+            return await ctx_or_interaction.response.send_message(content=content, embed=embed, ephemeral=ephemeral)
+        return await ctx_or_interaction.send(content=content, embed=embed)
+    except Exception as e:
+        print(f"Nie udało się wysłać wiadomości: {e}")
+        return None
+
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error: Exception):
+    """Globalny handler błędów dla komend prefixowych (!)."""
+    try:
+        if isinstance(error, commands.CheckFailure):
+            return  # cicho
+        if isinstance(error, commands.MissingRequiredArgument):
+            return await _safe_send(ctx, embed=_music_embed("Błąd", "Brak argumentu komendy."))
+        if isinstance(error, commands.BadArgument):
+            return await _safe_send(ctx, embed=_music_embed("Błąd", "Niepoprawny argument."))
+        if isinstance(error, commands.CommandNotFound):
+            return  # cicho
+
+        print(f"Błąd komendy {getattr(ctx.command, 'qualified_name', '?')}: {error}")
+        await _safe_send(ctx, embed=_music_embed("Błąd", "Coś poszło nie tak przy wykonywaniu komendy."))
+    except Exception as e:
+        print(f"Błąd on_command_error: {e}")
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    """Globalny handler błędów dla slash commands (/)."""
+    try:
+        # najczęstsze przypadki
+        if isinstance(error, app_commands.CheckFailure):
+            return
+        print(f"Błąd slash command: {error}")
+        await _safe_send(interaction, embed=_music_embed("Błąd", "Coś poszło nie tak przy wykonywaniu komendy."), ephemeral=True)
+    except Exception as e:
+        print(f"Błąd on_app_command_error: {e}")
+
+
+# ==========================
 # RUN BOT
 # ==========================
+# (musi być na samym końcu pliku, po definicjach komend)
+
+@bot.command(name="help")
+async def prefix_help(ctx: commands.Context):
+    """Pomoc dla komend ! (slash jest zalecany)."""
+    e = _music_embed("Pomoc • Komendy bota")
+
+    e.add_field(
+        name="Najlepsza opcja",
+        value="Użyj **`/help`** — tam masz podpowiedzi i autouzupełnianie komend.",
+        inline=False,
+    )
+
+    e.add_field(
+        name="Szybki skrót (prefix)",
+        value=(
+            "• `!play <query>` — dodaj utwór\n"
+            "• `!now` — co gra\n"
+            "• `!queue_show` — kolejka\n"
+            "• `!pause` / `!resume` / `!skip` / `!stop`\n"
+            "• `!loop off|song|queue`\n"
+            "• `!playlist_list` / `!playlist_show <name>` / `!playlist_play <name>`"
+        ),
+        inline=False,
+    )
+
+    await _safe_send(ctx, embed=e)
+
+
 bot.run(TOKEN)
