@@ -1,3 +1,4 @@
-discord.py
-wavelink
-Flask
+discord.py==2.4.0
+wavelink==3.4.1
+Flask==3.0.2
+

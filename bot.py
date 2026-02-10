@@ -281,8 +281,10 @@ async def _search_track(query: str) -> Optional[wavelink.Playable]:
     # Wavelink v2+ – uniwersalne wyszukiwanie.
     try:
         results = await wavelink.Playable.search(q)
-    except Exception:
-        results = None
+    except Exception as e:
+        # To jest najczęstsze miejsce problemów (brak node, błąd Lavalink, brak source).
+        print(f"Błąd Playable.search dla '{q}': {type(e).__name__}: {e}")
+        return None
 
     if not results:
         return None
@@ -471,12 +473,21 @@ async def play(ctx, *, query: str = ""):
     if not player:
         return
 
-    track = await _search_track(query)
+    try:
+        track = await _search_track(query)
+    except Exception as e:
+        print(f"Błąd w !play (search) dla '{query}': {type(e).__name__}: {e}")
+        return await _safe_send(ctx, embed=_music_embed("Błąd", "Nie udało się wyszukać utworu (błąd po stronie Lavalink/Wavelink)."))
+
     if not track:
         await _safe_send(ctx, embed=_music_embed("Szukaj", f"**Nie znaleziono utworu** dla: `{query}`"))
         return
 
-    await enqueue_and_maybe_play(ctx, player, track)
+    try:
+        await enqueue_and_maybe_play(ctx, player, track)
+    except Exception as e:
+        print(f"Błąd w !play (enqueue/play) dla '{query}': {type(e).__name__}: {e}")
+        await _safe_send(ctx, embed=_music_embed("Błąd", "Nie udało się dodać/odtworzyć utworu."))
 
 
 @bot.command()
