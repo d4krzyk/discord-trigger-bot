@@ -1,0 +1,16 @@
+server:
+  port: 2333
+lavalink:
+  server:
+    password: "youshallnotpass"
+    sources:
+      youtube: true
+      bandcamp: true
+      soundcloud: true
+      twitch: true
+      vimeo: true
+      mixer: true
+      http: true
+      local: false
+  buffer:
+    duration: 400
