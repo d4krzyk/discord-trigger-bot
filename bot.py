@@ -55,6 +55,10 @@ ALLOWED_ROLE_NAME = "Nekromanta"  # Rola, która może używać komend
 
 PLAYLISTS_FILE = "playlists.json"
 
+# Slash commands: dla jednego serwera najlepiej użyć guild sync (pojawia się od razu).
+# Możesz nadpisać to zmienną środowiskową GUILD_ID na Render.
+GUILD_ID = int(os.environ.get("GUILD_ID", "1470577436335931584"))
+
 intents = discord.Intents.default()
 intents.voice_states = True
 intents.members = True
@@ -296,6 +300,56 @@ async def _search_track(query: str) -> Optional[wavelink.Playable]:
 # ==========================
 # WAVELINK NODE
 # ==========================
+async def _connect_lavalink():
+    """Łączy się z Lavalink w sposób kompatybilny z różnymi wersjami Wavelink."""
+    host = os.environ.get("LAVALINK_HOST")
+    password = os.environ.get("LAVALINK_PASSWORD")
+    port = int(os.environ.get("LAVALINK_PORT", "2333"))
+    use_https = os.environ.get("LAVALINK_HTTPS", "0") == "1"
+
+    if not host or not password:
+        print("Brak LAVALINK_HOST lub LAVALINK_PASSWORD – muzyka nie będzie działać.")
+        return
+
+    # Wavelink v3+: Pool.connect
+    try:
+        Pool = getattr(wavelink, "Pool", None)
+        if Pool is not None:
+            # jeśli już istnieją nody, nie łącz ponownie
+            nodes = getattr(Pool, "nodes", None)
+            if isinstance(nodes, dict) and nodes:
+                return
+            if isinstance(nodes, list) and nodes:
+                return
+
+            node = wavelink.Node(uri=f"{'https' if use_https else 'http'}://{host}:{port}", password=password)
+            await Pool.connect(client=bot, nodes=[node])
+            return
+    except Exception as e:
+        print(f"Nie udało się połączyć z Lavalink przez Pool.connect: {e}")
+
+    # Wavelink v2: NodePool.create_node
+    try:
+        NodePool = getattr(wavelink, "NodePool", None)
+        if NodePool is not None:
+            nodes = getattr(NodePool, "nodes", None)
+            if nodes:
+                return
+
+            await NodePool.create_node(
+                bot=bot,
+                host=host,
+                port=port,
+                password=password,
+                https=use_https,
+            )
+            return
+    except Exception as e:
+        print(f"Nie udało się połączyć z Lavalink przez NodePool.create_node: {e}")
+
+    print("Nie znaleziono kompatybilnego API Wavelink do połączenia z Lavalink.")
+
+
 @bot.event
 async def on_ready():
     print(f"Zalogowany jako {bot.user}")
@@ -304,29 +358,11 @@ async def on_ready():
     if os.environ.get("RUN_WEB", "1") == "1":
         bot.loop.create_task(_run_web_server())
 
-    # Node twórz tylko raz
-    if not wavelink.NodePool.nodes:
-        host = os.environ.get("LAVALINK_HOST")
-        password = os.environ.get("LAVALINK_PASSWORD")
-        if not host or not password:
-            print("Brak LAVALINK_HOST lub LAVALINK_PASSWORD – muzyka nie będzie działać.")
-        else:
-            use_https = os.environ.get("LAVALINK_HTTPS", "0") == "1"
-            try:
-                await wavelink.NodePool.create_node(
-                    bot=bot,
-                    host=host,
-                    port=int(os.environ.get("LAVALINK_PORT", "2333")),
-                    password=password,
-                    https=use_https,
-                )
-            except Exception as e:
-                print(f"Nie udało się połączyć z Lavalink: {e}")
+    await _connect_lavalink()
 
     load_playlists()
 
-    # Sync slash commands
-    await _sync_app_commands()
+    # Sync robimy w setup_hook() (żeby /komendy pojawiały się poprawnie)
 
     print("Bot gotowy")
 
@@ -415,17 +451,29 @@ async def set_role(ctx, role: discord.Role):
 # ==========================
 # MUSIC COMMANDS
 # ==========================
-@bot.command()
+@bot.command(name="play", aliases=["p", "add"])
 @role_only()
-async def play(ctx, *, query: str):
+async def play(ctx, *, query: str = ""):
     """Dodaje utwór do kolejki (URL lub fraza) i startuje odtwarzanie."""
+    query = (query or "").strip()
+    if not query:
+        e = _music_embed(
+            "Play",
+            "**Musisz podać frazę albo link.**\n\n"
+            "Przykłady:\n"
+            "• `!play dark ambient`\n"
+            "• `!p lofi hip hop`\n"
+            "• `!play https://youtu.be/...`",
+        )
+        return await _safe_send(ctx, embed=e)
+
     player = await ensure_connected(ctx)
     if not player:
         return
 
     track = await _search_track(query)
     if not track:
-        await _safe_send(ctx, embed=_music_embed("Szukaj", "**Nie znaleziono utworu** dla podanego zapytania."))
+        await _safe_send(ctx, embed=_music_embed("Szukaj", f"**Nie znaleziono utworu** dla: `{query}`"))
         return
 
     await enqueue_and_maybe_play(ctx, player, track)
@@ -531,9 +579,18 @@ async def stop(ctx):
 # ==========================
 # PLAYLIST MANAGEMENT
 # ==========================
-@bot.command()
+@bot.command(name="playlist_create", aliases=["pl_create"])
 @role_only()
-async def playlist_create(ctx, name: str):
+async def playlist_create(ctx, *, name: str):
+    name = (name or "").strip()
+    if not name:
+        return await _safe_send(
+            ctx,
+            embed=_music_embed(
+                "Playlisty",
+                "**Musisz podać nazwę playlisty.**\nPrzykład: `!playlist_create dark ambient`",
+            ),
+        )
     if name in playlists:
         return await _safe_send(ctx, embed=_music_embed("Playlisty", f"Playlista **{name}** już istnieje."))
     playlists[name] = []
@@ -541,7 +598,7 @@ async def playlist_create(ctx, name: str):
     await _safe_send(ctx, embed=_music_embed("Playlisty", f"Utworzono playlistę: **{name}**"))
 
 
-@bot.command()
+@bot.command(name="playlist_list")
 @role_only()
 async def playlist_list(ctx):
     if not playlists:
@@ -552,66 +609,100 @@ async def playlist_list(ctx):
     await ctx.send(embed=e)
 
 
-@bot.command()
+@bot.command(name="playlist_add", aliases=["pl_add"])
 @role_only()
 async def playlist_add(ctx, playlist_name: str, *, query: str):
-    if playlist_name not in playlists:
-        return await _safe_send(ctx, embed=_music_embed("Playlisty", "**Nie znaleziono takiej playlisty.**"))
-    playlists[playlist_name].append(query)
-    save_playlists()
-    await _safe_send(ctx, embed=_music_embed("Playlisty", f"Dodano do **{playlist_name}**:\n`{query}`"))
+    playlist_name = (playlist_name or "").strip()
+    query = (query or "").strip()
 
-
-@bot.command()
-@role_only()
-async def playlist_remove(ctx, playlist_name: str = None, *, query: str = None):
     if not playlist_name or not query:
         return await _safe_send(
             ctx,
             embed=_music_embed(
                 "Playlisty",
-                "**Musisz podać nazwę playlisty i wpis do usunięcia.**\n"
-                "Przykład: `!playlist_remove moja_playlista utwór_xyz`",
+                "**Musisz podać nazwę playlisty i frazę/link do dodania.**\n"
+                "Przykład: `!playlist_add moja_playlista dark ambient`",
             ),
         )
 
     if playlist_name not in playlists:
         return await _safe_send(ctx, embed=_music_embed("Playlisty", "**Nie znaleziono takiej playlisty.**"))
 
-    if query not in playlists[playlist_name]:
+    playlists[playlist_name].append(query)
+    save_playlists()
+    await _safe_send(ctx, embed=_music_embed("Playlisty", f"Dodano do **{playlist_name}**:\n`{query}`"))
+
+
+@bot.command(name="playlist_remove", aliases=["pl_remove", "pl_del"])
+@role_only()
+async def playlist_remove(ctx, playlist_name: str = None, *, query: str = None):
+    playlist_name = (playlist_name or "").strip()
+    query = (query or "").strip()
+
+    if not playlist_name or not query:
+        return await _safe_send(
+            ctx,
+            embed=_music_embed(
+                "Playlisty",
+                "**Musisz podać nazwę playlisty i wpis do usunięcia.**\n"
+                "Przykład: `!playlist_remove moja_playlista dark ambient`",
+            ),
+        )
+
+    if playlist_name not in playlists:
+        return await _safe_send(ctx, embed=_music_embed("Playlisty", "**Nie znaleziono takiej playlisty.**"))
+
+    # Usuń pierwsze pasujące wystąpienie (case-insensitive), żeby UX był lepszy.
+    items = playlists[playlist_name]
+    idx = next((i for i, it in enumerate(items) if it.lower() == query.lower()), None)
+    if idx is None:
         return await _safe_send(ctx, embed=_music_embed("Playlisty", "**Ten wpis nie istnieje w playlistie.**"))
 
-    playlists[playlist_name].remove(query)
+    removed = items.pop(idx)
     save_playlists()
-    await _safe_send(ctx, embed=_music_embed("Playlisty", f"Usunięto z **{playlist_name}**:\n`{query}`"))
+    await _safe_send(ctx, embed=_music_embed("Playlisty", f"Usunięto z **{playlist_name}**:\n`{removed}`"))
 
 
-@bot.command()
+@bot.command(name="playlist_show", aliases=["pl_show"])
 @role_only()
-async def playlist_show(ctx, playlist_name: str):
+async def playlist_show(ctx, *, playlist_name: str):
+    playlist_name = (playlist_name or "").strip()
+    if not playlist_name:
+        return await _safe_send(ctx, embed=_music_embed("Playlisty", "**Musisz podać nazwę playlisty.**"))
+
     if playlist_name not in playlists:
-        return await ctx.send(embed=_music_embed("Playlista", "Nie znaleziono takiej playlisty."))
+        return await _safe_send(ctx, embed=_music_embed("Playlista", "Nie znaleziono takiej playlisty."))
 
     items = playlists[playlist_name]
     e = _music_embed(f"Playlista: {playlist_name}")
 
     if not items:
         e.description = "Playlista jest pusta."
-        return await ctx.send(embed=e)
+        return await _safe_send(ctx, embed=e)
 
     preview = "\n".join(f"{i+1}. {q}" for i, q in enumerate(items[:15]))
     if len(items) > 15:
         preview += f"\n… (+{len(items)-15} więcej)"
 
     e.description = preview
-    await ctx.send(embed=e)
+    await _safe_send(ctx, embed=e)
 
 
-@bot.command()
+@bot.command(name="playlist_play", aliases=["pl_play", "pl"])
 @role_only()
-async def playlist_play(ctx, playlist_name: str):
+async def playlist_play(ctx, *, playlist_name: str):
+    playlist_name = (playlist_name or "").strip()
+    if not playlist_name:
+        return await _safe_send(
+            ctx,
+            embed=_music_embed(
+                "Playlisty",
+                "**Musisz podać nazwę playlisty.**\nPrzykład: `!playlist_play moja_playlista`",
+            ),
+        )
+
     if playlist_name not in playlists:
-        return await ctx.send(embed=_music_embed("Playlista", "Nie znaleziono takiej playlisty."))
+        return await _safe_send(ctx, embed=_music_embed("Playlista", "Nie znaleziono takiej playlisty."))
 
     player = await ensure_connected(ctx)
     if not player:
@@ -619,7 +710,7 @@ async def playlist_play(ctx, playlist_name: str):
 
     items = playlists[playlist_name]
     if not items:
-        return await ctx.send(embed=_music_embed("Playlista", "Playlista jest pusta."))
+        return await _safe_send(ctx, embed=_music_embed("Playlista", "Playlista jest pusta."))
 
     added = 0
     for q in items:
@@ -630,7 +721,7 @@ async def playlist_play(ctx, playlist_name: str):
 
     e = _music_embed(f"Dodano playlistę: {playlist_name}", f"Dodano do kolejki: **{added}**/**{len(items)}**")
     e.add_field(name="Kolejka", value=str(len(queue)), inline=True)
-    await ctx.send(embed=e)
+    await _safe_send(ctx, embed=e)
 
     if not player.playing and not player.paused:
         await play_next(ctx.guild)
@@ -742,12 +833,27 @@ def _track_duration_ms(track: wavelink.Playable) -> Optional[int]:
 # SYNC COMMANDS
 # ==========================
 async def _sync_app_commands():
-    """Synchronizuje slash commands (globalnie)."""
+    """Synchronizuje slash commands.
+
+    Jeśli GUILD_ID jest ustawione, synchronizuje tylko dla tego serwera (natychmiastowe).
+    W przeciwnym razie robi global sync (może propagować się dłużej).
+    """
     try:
-        synced = await _tree.sync()
-        print(f"Zsynchronizowano slash commands: {len(synced)}")
+        if GUILD_ID:
+            guild = discord.Object(id=GUILD_ID)
+            synced = await _tree.sync(guild=guild)
+            print(f"Zsynchronizowano slash commands dla guild={GUILD_ID}: {len(synced)}")
+        else:
+            synced = await _tree.sync()
+            print(f"Zsynchronizowano slash commands globalnie: {len(synced)}")
     except Exception as e:
         print(f"Nie udało się zsynchronizować slash commands: {e}")
+
+
+@bot.event
+async def setup_hook():
+    """Wywoływane raz przy starcie. Najlepsze miejsce na sync slash commands."""
+    await _sync_app_commands()
 
 # ==========================
 # SLASH COMMANDS (podpowiedzi w Discord)
