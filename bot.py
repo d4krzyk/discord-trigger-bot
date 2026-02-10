@@ -283,6 +283,7 @@ async def on_ready():
             host=os.environ.get("LAVALINK_HOST"),
             port=int(os.environ.get("LAVALINK_PORT", "2333")),
             password=os.environ.get("LAVALINK_PASSWORD"),
+            https=True
         )
 
     load_playlists()
