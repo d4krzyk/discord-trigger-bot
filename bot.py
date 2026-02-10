@@ -4,7 +4,7 @@ import os
 
 TOKEN = os.environ["DISCORD_TOKEN"]
 
-ZAKAZANY_LAS_VC = 1470621135556186182
+ZAKAZANY_LAS_VC = 1470833237013037299
 TAJNE_ZAKLECIA_TEXT = 1470635892275286026
 AURA_BOT_ID = 1448399268384870663  # ID Aura Music Bot
 
@@ -32,6 +32,9 @@ async def on_voice_state_update(member, before, after):
         humans = real_users(before.channel)
         if len(humans) == 0:
             playlist_active = False
+            aura = before.channel.guild.get_member(AURA_BOT_ID)
+            if aura and aura.voice:
+                await aura.move_to(None)
 
     # TRIGGER — pierwszy człowiek wchodzi
     if after.channel and after.channel.id == ZAKAZANY_LAS_VC:
