@@ -186,3 +186,9 @@ Jeśli Lavalink działa po zwykłym HTTP (w logach masz `Undertow started on por
 Jeśli masz reverse proxy i HTTPS, ustaw:
 
 - `LAVALINK_HTTPS=1`
+
+## Wersja Pythona (ważne na Render)
+
+Używaj **Python 3.12** (ustawione w `runtime.txt`).
+
+> Na Python 3.13 możesz dostać błąd `ModuleNotFoundError: No module named 'audioop'`, bo `audioop` został usunięty ze standardowej biblioteki, a `discord.py` nadal go używa.
